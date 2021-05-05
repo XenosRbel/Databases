@@ -1,0 +1,1689 @@
+class IbanValidator < ActiveModel::Validator
+  def validate(record)
+    return if valid_iban?(record)
+
+    record.errors.add(options[:field], :invalid_format)
+  end
+
+  private
+
+  IBAN_PATTERN = /^([A-Z]{2}[ \-]?[0-9]{2})(?=(?:[ \-]?[A-Z0-9]){9,30}$)((?:[ \-]?[A-Z0-9]{3,5}){2,7})([ \-]?[A-Z0-9]{1,3})?$/.freeze
+
+  def valid_iban?(record)
+    iban = record.__send__(options[:field])
+    (iban =~ IBAN_PATTERN).present?
+  end
+end
+
+class EmailValidator < ActiveModel::Validator
+  def validate(record)
+    return if valid?(record)
+
+    record.errors.add(options[:field], :invalid_format)
+  end
+
+  private
+
+  def valid?(record)
+    value = record.__send__(options[:field])
+    (value =~ Devise.email_regexp).present?
+  end
+end
+
+class PhoneNumberValidator < ActiveModel::Validator
+  def validate(record)
+    return if valid_phone_number?(record)
+
+    record.errors.add(options[:field], :invalid_format)
+  end
+
+  private
+
+  PHONE_NUMBER_PATTERN = /^\+375(17|29|33|44)\d{3}\d{2}\d{2}$/.freeze
+
+  def valid_phone_number?(record)
+    phone_number = record.__send__(options[:field])
+    (phone_number =~ PHONE_NUMBER_PATTERN).present?
+  end
+end
+
+class BaseSerializer
+  include FastJsonapi::ObjectSerializer
+
+  def serializable_hash
+    hash = super
+    hash.deep_transform_keys! { |key| key.to_s.camelize(:lower).to_sym } if camelize_keys?
+    hash
+  end
+  alias to_hash serializable_hash
+
+  def as_json
+    is_collection?(@resource, @is_collection) ? as_collection_json : as_one_record_json
+  end
+
+  private
+
+  attr_reader :params
+
+  def camelize_keys?
+    params[:camelize_keys].present?
+  end
+
+  def as_collection_json
+    to_hash[:data].map { |hash| hash[:attributes] }
+  end
+
+  def as_one_record_json
+    (to_hash[:data] || {})[:attributes]
+  end
+end
+
+class ApplicationJob < ActiveJob::Base
+end
+
+module ApplicationHelper
+  include Chartkick::Helper
+  include ::FormatterHelper
+
+  IBAN_PATTERN = /^([A-Z]{2}[ \-]?[0-9]{2})(?=(?:[ \-]?[A-Z0-9]){9,30}$)((?:[ \-]?[A-Z0-9]{3,5}){2,7})([ \-]?[A-Z0-9]{1,3})?$/.freeze
+
+  def path_for(model)
+    public_send("#{model.class.name.split('::').last.downcase}_path", model)
+  end
+
+  def edit_path_for(model)
+    "#{path_for(model)}/edit"
+  end
+
+  def new_path_for(model)
+    public_send("new_#{model.name.split('::').last.downcase}_path")
+  end
+
+  def search_for(model)
+    model_name = model.name.split("::").last.downcase.pluralize
+    return public_send("#{model_name}_index_path") if model_name.to_sym == :news
+
+    public_send("#{model_name}_path")
+  end
+
+  def title
+    I18n.t("actions.#{params[:controller]}")
+  end
+
+  def read_constant(constant_name)
+    self.class.const_get(constant_name)
+  end
+
+  def setting
+    @setting ||= ::Setting
+  end
+end
+
+module RespondHelper
+  def respond_html_json_and_pdf_for(model, options = {})
+    template = options.delete :template
+    respond_to do |format|
+      format.html { render template if template.present? }
+      format.json { render json: model }
+      format.pdf { render respond_pdf(model) }
+    end
+  end
+
+  private
+
+  def respond_pdf(model)
+    {
+      pdf: I18n.t("reports.pdf_report_title",
+                  entity_title: pdf_title(model),
+                  report_at: Time.now.strftime(read_constant(:DATETIME_FORMAT))),
+      page_size: "A4",
+      template: template_pat(model),
+      layout: "pdf.slim",
+      orientation: "Portrait",
+      lowquality: true,
+      zoom: 1,
+      dpi: 75,
+    }
+  end
+
+  def pdf_title(model)
+    model.class.name.split("::").last
+  end
+
+  def template_pat(_model)
+    "#{params.fetch(:controller, '')}/#{params.fetch(:action, '')}.slim"
+  end
+end
+
+module FormatterHelper
+  DATETIME_FORMAT = "%H:%M %d.%m.%Y"
+end
+
+module VoucherHelper
+  VOUCHER_LENGTH = 12
+
+  def create_voucher
+    return if voucher.present?
+
+    self.voucher = genarate_voucher(VOUCHER_LENGTH)
+  end
+
+  private
+
+  def genarate_voucher(number)
+    charset = Array("A".."Z") + Array("a".."z") + Array(0..9)
+    Array.new(number) { charset.sample }.join
+  end
+end
+
+require "application_responder"
+
+class ApplicationController < ::ActionController::Base
+  include ::ApplicationHelper
+
+  self.responder = ApplicationResponder
+  respond_to :html
+
+  private
+
+  def after_sign_out_path_for(_resource_or_scope)
+    Admin::Engine.routes.url_helpers.root_path
+  end
+
+  def after_sign_in_path_for(_resource)
+    Admin::Engine.routes.url_helpers.root_path
+  end
+end
+
+class User < ApplicationRecord
+  validates_with ::PhoneNumberValidator, field: :phone_number
+  validates_presence_of :first_name, :last_name, :father_name, :phone_number
+
+  def full_name
+    "#{first_name}\t#{last_name}\t#{father_name}"
+  end
+end
+
+class Ability
+  include CanCan::Ability
+
+  PERMISSIONS = {}.freeze
+
+  def initialize(user)
+    @user = user
+
+    define_permissions
+  end
+
+  private
+
+  def define_permissions
+    define(self.class::PERMISSIONS, :can)
+  end
+
+  def define(rules, method)
+    rules.each do |(action, resources)|
+      case resources
+      when Hash
+        __send__(method.to_sym, action, resources[:resources], resources[:condition])
+      else
+        __send__(method.to_sym, action, resources)
+      end
+    end
+  end
+end
+
+class Setting < RailsSettings::Base
+  store File.join(Rails.root, "config", "app.yml")
+  cache_prefix { "v1" }
+
+  field :title, type: :string, default: "Tire Service"
+  field :vat, type: :string, default: 20
+  field :currency, type: :string, default: "$"
+  field :company_name, type: :string, default: "LTD Tire Service"
+  field :iban, type: :string, default: "ААВВ ССС DDDD ЕЕЕЕ ЕЕЕЕ ЕЕЕЕ ЕЕЕЕ"
+  field :payer_account_number, type: :string, default: 156_212_314
+  field :admin_emails, default: "admin@rubyonrails.org", type: :array
+
+  with_options if: -> { var.to_sym == :iban } do |on_condition|
+    on_condition.validates_with IbanValidator, field: :value
+  end
+end
+
+class ApplicationRecord < ActiveRecord::Base
+  include PgSearch::Model
+  self.abstract_class = true
+end
+
+class ApplicationMailer < ActionMailer::Base
+  default from: 'from@example.com'
+  layout 'mailer'
+end
+
+class CheckboxInput < SimpleForm::Inputs::StringInput
+  def input(wrapper_options = nil)
+    merged_input_options = merge_wrapper_options(input_html_options, wrapper_options)
+    tag_name = "#{@builder.object_name}[#{attribute_name}]"
+    template.check_box_tag(tag_name, options["value"] || 1, options["checked"], merged_input_options)
+  end
+
+  private
+
+  def input_html_options
+    super.merge(class: [:boolean, :optional, "col-sm-2"])
+  end
+end
+
+module Sanitizers
+  class PhoneNumber
+    SPACE_OR_TAB = /[[:blank:]]/.freeze
+    LETTER = /[[:alpha:]]/.freeze
+    PHONE_SANITIZE = /#{SPACE_OR_TAB}|#{LETTER}/.freeze
+
+    def call(data)
+      return "" if data.blank?
+
+      sanitize(data)
+    end
+
+    private
+
+    def sanitize(data)
+      remove_white_space_and_letters(data)
+      add_start_code(data)
+    end
+
+    def add_start_code(data)
+      return data if start_of_code?(data)
+
+      data.gsub!(/^/, "+")
+    end
+
+    def remove_white_space_and_letters(data)
+      data.gsub!(PHONE_SANITIZE, "")
+    end
+
+    def start_of_code?(data)
+      data.match(/^\+/).present?
+    end
+  end
+end
+
+module ApplicationCable
+  class Channel < ActionCable::Channel::Base
+  end
+end
+
+module ApplicationCable
+  class Connection < ActionCable::Connection::Base
+  end
+end
+
+module Admin
+  class SettingSerializer < BaseSerializer
+    set_type :setting
+
+    set_key_transform :camel_lower
+
+    attributes :vat,
+               :title,
+               :currency
+  end
+end
+
+module Admin
+  module ApplicationHelper
+    include BootstrapIcons::Rails::BiIconHelper
+
+    def navigation
+      @navigation ||= Admin::NavigationBuilder.new.call(current_ability: current_ability.class)
+    end
+
+    def read_constant(constant_name)
+      self.class.const_get(constant_name)
+    end
+  end
+end
+
+module Admin
+  module RespondHelper
+    include ::RespondHelper
+
+    def respond_html_and_datatable_json_for(model, options = {})
+      template = options.delete :template
+      respond_to do |format|
+        format.html { render template if template.present? }
+        format.json { render json: datatable_for(model, options) }
+      end
+    end
+
+    def respond_json_with_errors(model)
+      render json: model.errors.full_messages, status: :unprocessable_entity
+    end
+  end
+end
+
+module Admin
+  module OrdersHelper
+    def discount_title(order)
+      order.discount.present? ? order.discount.title : ""
+    end
+  end
+end
+
+module SiteHandler
+  extend ActiveSupport::Concern
+
+  DEFAULT_LOCALE = "ru"
+
+  included do
+    helper_method :params_selected
+
+    def params_selected
+      request.params[:selected].presence
+    end
+
+    private
+
+    def raise_not_found_error
+      raise ActionController::RoutingError, "Not Found"
+    end
+
+    def stripped_domain
+      request.env["HTTP_HOST"].sub("www.", "")
+    end
+  end
+end
+
+module Admin
+  class SessionsController < Devise::SessionsController
+    before_action :configure_sign_in_params, only: [:create]
+
+    UPDATE_MODEL_PARAMS = %i[email
+                             password
+                             remember_me].freeze
+    MODEL_PARAMS = UPDATE_MODEL_PARAMS
+
+    def new
+      super
+    end
+
+    def create
+      super
+    end
+
+    def destroy
+      super
+    end
+
+    protected
+
+    def configure_sign_in_params
+      params.require(:administrator).permit(*MODEL_PARAMS)
+    end
+  end
+end
+
+module Admin
+  class UsersController < Admin::ApplicationController
+    include Admin::Datatable
+
+    load_and_authorize_resource
+    skip_load_resource only: :index
+
+    UPDATE_USER_PARAMS = %i[first_name
+                            last_name
+                            father_name
+                            phone_number].freeze
+    USER_PARAMS = UPDATE_USER_PARAMS
+
+    datatable model: ::User, exclude_attributes: %w[created_at updated_at]
+
+    def index
+      @users = User.all
+
+      respond_to do |format|
+        format.html
+        format.json { render json: @users }
+      end
+    end
+
+    def new; end
+
+    def edit; end
+
+    def create
+      @user.save
+    end
+
+    def update
+      @user.update update_user_params
+      respond_with @user, location: users_path
+    end
+
+    def destroy
+      @user.destroy
+      respond_with @user, location: users_path
+    end
+
+    private
+
+    def user_params
+      params.require(:user).permit(*USER_PARAMS)
+    end
+
+    def update_user_params
+      params.require(:user).permit(*UPDATE_USER_PARAMS)
+    end
+  end
+end
+
+module Admin
+  class OmniauthCallbacksController < Devise::OmniauthCallbacksController
+  end
+end
+
+module Admin
+  class SettingsController < Admin::ApplicationController
+    def index; end
+
+    def create; end
+
+    def edit; end
+
+    def update
+      setting_params.keys.each do |key|
+        Setting.__send__("#{key}=", setting_params[key].strip) unless setting_params[key].nil?
+      end
+
+      redirect_to setting_path, notice: "Setting was successfully updated."
+    rescue StandardError => exception
+      respond_with @setting, location: setting_path, notice: exception.message
+    end
+
+    private
+
+    def setting_params
+      params.require(:setting)
+    end
+  end
+end
+
+module Admin
+  class MastersController < Admin::ApplicationController
+    include Admin::Datatable
+
+    load_and_authorize_resource
+    skip_load_resource only: :index
+
+    datatable model: Master, exclude_attributes: %w[created_at updated_at]
+
+    UPDATE_MODEL_PARAMS = %i[last_name
+                             first_name
+                             father_name
+                             phone_number
+                             specialization
+                             work_experience].freeze
+    MODEL_PARAMS = UPDATE_MODEL_PARAMS
+
+    def create
+      @master = model.create(sanitized_params)
+      respond_with @master, location: masters_path
+    end
+
+    def update
+      @master.update(sanitized_params)
+      respond_with @master, location: master_path
+    end
+
+    def destroy
+      @master.destroy
+      redirect_to masters_path
+    end
+
+    private
+
+    def sanitized_params
+      phone_number = model_params.fetch(:phone_number, "")
+      sanitized_phone_number = ::Sanitizers::PhoneNumber.new.call(phone_number)
+      model_params.merge(phone_number: sanitized_phone_number)
+    end
+  end
+end
+
+module Admin
+  class UnlocksController < Devise::UnlocksController
+  end
+end
+
+module Admin
+  class AdministratorsController < Admin::ApplicationController
+    include Admin::Datatable
+
+    load_and_authorize_resource
+    skip_load_resource only: :index
+
+    before_action :select_option_collection, only: %i[edit new update create]
+
+    datatable model: Administrator, exclude_attributes: %w[encrypted_password
+                                                           reset_password_token
+                                                           reset_password_sent_at
+                                                           remember_created_at
+                                                           created_at
+                                                           updated_at]
+
+    UPDATE_MODEL_PARAMS = %i[last_name
+                             first_name
+                             father_name
+                             phone_number
+                             email
+                             role
+                             password
+                             password_confirmation].freeze
+    MODEL_PARAMS = UPDATE_MODEL_PARAMS
+
+    def create
+      @administrator = model.create(sanitized_params)
+      respond_with @administrator, location: administrators_path
+    end
+
+    def update
+      @administrator.update(sanitized_params)
+      respond_with @administrator, location: administrator_path
+    end
+
+    def destroy
+      @administrator.destroy
+      redirect_to administrators_path
+    end
+
+    private
+
+    def select_option_collection
+      @role_select_options = Administrator::AVAILABLE_ROLES.map do |role|
+        [I18n.t("activerecord.attributes.admin/administrator.roles.#{role}"), role, { data: { type: role } }]
+      end
+    end
+
+    def sanitized_params
+      phone_number = model_params.fetch(:phone_number, "")
+      sanitized_phone_number = ::Sanitizers::PhoneNumber.new.call(phone_number)
+      model_params.merge(phone_number: sanitized_phone_number)
+    end
+  end
+end
+
+module Admin
+  class ServicesController < Admin::ApplicationController
+    include Admin::Datatable
+
+    load_and_authorize_resource
+    skip_load_resource only: :index
+
+    datatable model: Service, exclude_attributes: %w[created_at updated_at]
+
+    UPDATE_MODEL_PARAMS = %i[title
+                             description
+                             price].freeze
+    MODEL_PARAMS = UPDATE_MODEL_PARAMS
+
+    def create
+      @service = model.create(model_params)
+      respond_with @service, location: services_path
+    end
+
+    def update
+      @service.update(model_params)
+      respond_with @service, location: service_path
+    end
+
+    def destroy
+      @service.destroy
+      redirect_to services_path
+    end
+  end
+end
+
+module Admin
+  class ApplicationController < ::ApplicationController
+    include Admin::SiteHandler
+    include Admin::ApplicationHelper
+    include Admin::RespondHelper
+
+    before_action :authenticate_administrator!, :set_current_administrator
+
+    respond_to :html
+    respond_to :json
+
+    protect_from_forgery with: :exception
+
+    layout "admin"
+
+    rescue_from CanCan::AccessDenied do |exception|
+      if current_administrator
+        redirect_to root_path
+      else
+        flash[:error] = exception.message
+        head status: :unauthorized
+      end
+    end
+
+    def index
+      @model_attributes = model_attributes
+      @model = model
+      @model_items = respond_with_search
+    end
+
+    def create
+      @model = model.new(model_params)
+      redirect_to @model if @model.save
+    end
+
+    private
+
+    def redirect_to_action_if_valid(model, action = :index)
+      if model.valid?
+        redirect_to action: action
+      else
+        respond_with model
+      end
+    end
+
+    def authenticate_administrator!
+      if administrator_signed_in?
+        super
+      else
+        redirect_to administrator_session_path, notice: "if you want to add a notice"
+      end
+    end
+
+    def redirect_back_or_root(**args)
+      redirect_back(fallback_location: root_path, **args)
+    end
+
+    def set_current_administrator
+      Admin::Administrator.current = current_administrator
+    end
+
+    def current_ability
+      @current_ability ||= Abilities::Factory.build(current_administrator)
+    end
+
+    def model_params
+      params.require(model_symbolize).permit(*read_constant(:MODEL_PARAMS))
+    end
+
+    def model_symbolize
+      model.to_s.downcase.split("::").last.to_sym
+    end
+  end
+end
+
+module Admin
+  class ConfirmationsController < Devise::ConfirmationsController; end
+end
+
+module Admin
+  class OrdersController < Admin::ApplicationController
+    include Admin::Datatable
+
+    load_and_authorize_resource
+    skip_load_resource only: :index
+
+    before_action :select_option_collection, only: %i[edit new update]
+
+    datatable model: Order, exclude_attributes: %w[created_at
+                                                   updated_at
+                                                   admin_discount_id
+                                                   admin_customer_id
+                                                   admin_master_id]
+
+    UPDATE_MODEL_PARAMS = %i[admin_discount_id
+                             admin_customer_id
+                             admin_master_id
+                             end_execution_at
+                             start_execution_at].freeze
+    MODEL_PARAMS = UPDATE_MODEL_PARAMS + [service_ids: []]
+
+    def create
+      @order = model.create(model_params)
+      respond_with @order, location: orders_path
+    end
+
+    def update
+      @order.update(model_params)
+      respond_with @order, location: order_path
+    end
+
+    def destroy
+      @order.destroy
+      redirect_to orders_path
+    end
+
+    private
+
+    def select_option_collection
+      @master_select_options = Admin::Master.all
+        .map { |item| [item.full_name, item.id, { data: { type: item.id } }] }
+      @customer_select_options = Admin::Customer.all
+        .map { |item| [item.full_name, item.id, { data: { type: item.id } }] }
+      @discount_select_options = Admin::Discount.published
+        .map { |item| [item.title, item.id, { data: { type: item.id } }] }
+    end
+  end
+end
+
+module Admin
+  class DiscountsController < Admin::ApplicationController
+    include Admin::Datatable
+
+    load_and_authorize_resource
+    skip_load_resource only: :index
+
+    datatable model: Discount, exclude_attributes: %w[created_at updated_at]
+
+    UPDATE_MODEL_PARAMS = %i[title
+                             description
+                             end_date_at
+                             start_date_at
+                             percent].freeze
+    MODEL_PARAMS = UPDATE_MODEL_PARAMS
+
+    def create
+      @discount = model.create(model_params)
+      respond_with @discount, location: discounts_path
+    end
+
+    def update
+      @discount.update(model_params)
+      respond_with @discount, location: discount_path
+    end
+
+    def destroy
+      @discount.destroy
+      redirect_to discounts_path
+    end
+  end
+end
+
+module Admin
+  class NewsController < Admin::ApplicationController
+    include Admin::Datatable
+
+    load_and_authorize_resource
+    skip_load_resource only: :index
+
+    datatable model: News, exclude_attributes: %w[created_at updated_at]
+
+    UPDATE_MODEL_PARAMS = %i[title
+                             content].freeze
+    MODEL_PARAMS = UPDATE_MODEL_PARAMS
+
+    def create
+      @news = model.create(model_params)
+      respond_with @news, location: news_index_path
+    end
+
+    def update
+      @news.update(model_params)
+      respond_with @news, location: news_path
+    end
+
+    def destroy
+      @news.destroy
+      redirect_to news_index_path
+    end
+  end
+end
+
+module Admin
+  class CustomersController < Admin::ApplicationController
+    include Admin::Datatable
+
+    load_and_authorize_resource
+    skip_load_resource only: :index
+
+    UPDATE_MODEL_PARAMS = %i[last_name
+                             first_name
+                             father_name
+                             phone_number].freeze
+    MODEL_PARAMS = UPDATE_MODEL_PARAMS
+
+    datatable model: Customer, exclude_attributes: %w[created_at updated_at]
+
+    def create
+      @customer = model.create(sanitized_params)
+      respond_with @customer, location: customers_path
+    end
+
+    def update
+      @customer.update(sanitized_params)
+      respond_with @order, location: customer_path
+    end
+
+    def destroy
+      @customer.destroy
+      redirect_to customers_path
+    end
+
+    private
+
+    def sanitized_params
+      phone_number = model_params.fetch(:phone_number, "")
+      sanitized_phone_number = ::Sanitizers::PhoneNumber.new.call(phone_number)
+      model_params.merge(phone_number: sanitized_phone_number)
+    end
+  end
+end
+
+module Admin
+  class PasswordsController < Devise::PasswordsController; end
+end
+
+module Admin
+  class RegistrationsController < Devise::RegistrationsController
+    ADMIN_ADMINISTRATOR_PARAMS = %i[email password first_name last_name father_name phone_number role].freeze
+
+    def create
+      build_administrator_with_role(:manager) unless create_chief_executive_officer.present?
+
+      redirect_to administrator_session_path
+    end
+
+    private
+
+    def create_chief_executive_officer
+      return if Admin::Administrator.where(role: "chief_executive_officer").take.present?
+
+      build_administrator_with_role(:chief_executive_officer)
+    end
+
+    def build_administrator_with_role(role)
+      @administrator = Admin::Administrator.new(administrator_params)
+      @administrator.role = role.to_s
+      @administrator.save
+    end
+
+    def administrator_params
+      params.require(:administrator).permit(*ADMIN_ADMINISTRATOR_PARAMS)
+    end
+  end
+end
+
+module Admin
+  class HomeController < Admin::ApplicationController
+    skip_load_and_authorize_resource
+
+    def index; end
+  end
+end
+
+module Cdn
+  class OrdersController < ApplicationController
+    include ::RespondHelper
+    include ::ApplicationHelper
+
+    def index
+      @orders = Admin::Order.where(id: params[:orders_ids])
+
+      respond_html_json_and_pdf_for(@orders)
+    end
+  end
+end
+
+module Api
+  class ApplicationController < ActionController::Base
+    include SiteHandler
+    include ::RespondHelper
+
+    respond_to :json
+    rescue_from StandardError, with: :exception
+    rescue_from ActiveRecord::RecordNotFound, with: :record_not_found
+    rescue_from ActionController::ParameterMissing, with: :bad_request
+
+    private
+
+    def record_not_found
+      head :not_found
+    end
+
+    def record_invalid
+      head :unprocessable_entity
+    end
+
+    def bad_request
+      head :bad_request
+    end
+
+    def exception(exception)
+      Rails.logger.error(exception.full_message)
+      head :internal_server_error
+    end
+  end
+end
+
+module Front
+  class HomeController < ApplicationController
+    include ::RespondHelper
+
+    layout "front"
+
+    before_action :home_params, only: %i[index]
+
+    def order_info
+      @orders = search_by_params(params[:search])
+
+      respond_html_json_and_pdf_for(@orders, template: { partial: "order_info" })
+    end
+
+    private
+
+    PHONE_NUMBER_PATTERN = /^\+375(17|29|33|44)\d{3}\d{2}\d{2}$/.freeze
+
+    def search_by_params(value)
+      by_id = search_by_order_id(value)
+      return by_id if by_id.present?
+
+      by_phone = search_by_phone_number(value)
+      return by_phone if by_phone.present?
+
+      []
+    end
+
+    def search_by_order_id(value)
+      Admin::Order.find_not_finished.where(id: value)
+    end
+
+    def search_by_phone_number(value)
+      phone_number = ::Sanitizers::PhoneNumber.new.call(value)
+      customer = Admin::Customer.where(phone_number: phone_number).take
+      return customer.orders.find_not_finished if valid_phone_number?(value) && customer.present?
+    end
+
+    def home_params
+      @news = Admin::News.all.order(updated_at: :ASC)
+    end
+
+    def valid_phone_number?(phone_number)
+      (phone_number =~ PHONE_NUMBER_PATTERN).present?
+    end
+  end
+end
+
+module Abilities
+  class ChiefEditor < BaseAbility
+    MODELS = [
+      ::Admin::Order,
+      ::Admin::Customer,
+      ::Admin::Administrator,
+      ::Admin::Discount,
+      ::Admin::Master,
+      ::Admin::Service,
+      ::Admin::News
+    ].freeze
+
+    PERMISSIONS = {
+      read: [
+        ::Admin::Administrator
+      ],
+      manage: [
+        ::Admin::Order,
+        ::Admin::Customer,
+        ::Admin::Discount,
+        ::Admin::Master,
+        ::Admin::Service,
+        ::Admin::News
+      ]
+    }.freeze
+  end
+end
+
+module Abilities
+  class Manager < BaseAbility
+    MODELS = [
+      ::Admin::Order,
+      ::Admin::Customer,
+      ::Admin::Administrator,
+      ::Admin::Discount,
+      ::Admin::Master,
+      ::Admin::Service
+    ].freeze
+
+    PERMISSIONS = {
+      edit: [::Admin::Order],
+      read: [::Admin::Order,
+             ::Admin::Customer,
+             ::Admin::Administrator,
+             ::Admin::Discount,
+             ::Admin::Master,
+             ::Admin::Service,
+             ::Admin::News],
+      create: [::Admin::Order, ::Admin::Customer]
+    }.freeze
+  end
+end
+
+module Abilities
+  class Factory
+    class << self
+      def build(user = ::Admin::Administrator.new)
+        return Ability.new(user) unless user.role_available?
+
+        ability_class_for(user).new(user)
+      end
+
+      private
+
+      def ability_class_for(user)
+        "Abilities::#{user.role.classify}".constantize
+      end
+    end
+  end
+end
+
+module Abilities
+  class ChiefExecutiveOfficer < BaseAbility
+    MODELS = [
+      ::Admin::Order,
+      ::Admin::Customer,
+      ::Admin::Administrator,
+      ::Admin::Discount,
+      ::Admin::Master,
+      ::Admin::Service,
+      ::Admin::News
+    ].freeze
+
+    PERMISSIONS = {
+      manage: MODELS + [::User, ::Setting]
+    }.freeze
+  end
+end
+
+module Abilities
+  class BaseAbility < Ability
+    PERMISSIONS = {}.freeze
+  end
+end
+
+module Admin
+  class News < ApplicationRecord
+    pg_search_scope :search, against: %i[id
+                                         title
+                                         content]
+
+    validates_presence_of :title, :content
+  end
+end
+
+module Admin
+  class Order < ApplicationRecord
+    has_and_belongs_to_many :services, class_name: "Admin::Service"
+
+    belongs_to :master, foreign_key: :admin_master_id, class_name: "Admin::Master"
+    belongs_to :discount, foreign_key: :admin_discount_id, required: false, class_name: "Admin::Discount"
+    belongs_to :customer, foreign_key: :admin_customer_id, class_name: "Admin::Customer"
+
+    validates_presence_of :services, :end_execution_at, :start_execution_at
+    validates_datetime :end_execution_at, after: :start_execution_at, allow_blank: false
+
+    pg_search_scope :search, against: %i[id end_execution_at start_execution_at]
+
+    scope :find_not_finished, lambda {
+      where(
+        arel_table[:start_execution_at]
+          .lt(arel_table[:end_execution_at])
+          .and(arel_table[:end_execution_at]
+            .gt(Arel::Nodes::NamedFunction.new("now", [])))
+      )
+    }
+
+    def total_sum
+      services.sum(:price)
+    end
+
+    def discount_amount
+      percent = discount.nil? ? 0 : discount.percent
+      (total_sum * percent / 100).round(2)
+    end
+
+    def total_sum_with_discount
+      percent = discount.nil? ? 0 : discount.percent
+      (total_sum - (total_sum * percent / 100)).round(2)
+    end
+  end
+end
+
+module Admin
+  class Administrator < User
+    extend Enumerize
+    include VoucherHelper
+
+    self.table_name = :admin_administrators
+
+    AVAILABLE_ROLES = %w[
+      chief_executive_officer chief_editor manager
+    ].freeze
+
+    devise :database_authenticatable, :registerable,
+           :recoverable, :rememberable, :validatable
+
+    validates :email, :first_name, :last_name, :father_name, :phone_number, :role, presence: true
+    validates :phone_number, uniqueness: { scope: :phone_number }
+
+    enumerize :role, in: AVAILABLE_ROLES, predicates: true
+
+    before_validation :create_voucher
+
+    pg_search_scope :search, against: %i[id
+                                         email
+                                         first_name
+                                         last_name
+                                         father_name
+                                         phone_number
+                                         role]
+
+    class << self
+      def current=(user)
+        RequestStore.store[:current_administrator] = user
+      end
+
+      def current
+        RequestStore.store[:current_administrator]
+      end
+    end
+
+    def role_available?
+      AVAILABLE_ROLES.include?(role)
+    end
+  end
+end
+
+module Admin
+  class Discount < ApplicationRecord
+    has_many :orders, foreign_key: :admin_discount_id, class_name: "Admin::Order"
+
+    validates_datetime :end_date_at, after: :start_date_at
+    validates_presence_of :title, :description, :start_date_at, :end_date_at
+    validates :percent,
+              numericality: { only_integer: true },
+              length: { maximum: 100, minimum: 0 },
+              allow_blank: false,
+              presence: true
+
+    pg_search_scope :search, against: %i[id
+                                         title
+                                         description]
+
+    scope :published, lambda {
+      where(
+        arel_table[:start_date_at]
+          .lt(arel_table[:end_date_at])
+          .and(arel_table[:end_date_at]
+            .gt(Arel::Nodes::NamedFunction.new("now", [])))
+      )
+    }
+  end
+end
+
+module Admin
+  class Customer < User
+    self.table_name = :admin_customers
+
+    has_many :orders, foreign_key: :admin_customer_id, class_name: "Admin::Order"
+
+    pg_search_scope :search, against: %i[id
+                                         first_name
+                                         last_name
+                                         father_name
+                                         phone_number]
+  end
+end
+
+module Admin
+  class Master < User
+    self.table_name = :admin_masters
+
+    has_many :orders, foreign_key: :admin_master_id, class_name: "Admin::Order"
+
+    pg_search_scope :search, against: %i[id
+                                         first_name
+                                         last_name
+                                         father_name
+                                         phone_number
+                                         work_experience
+                                         specialization]
+
+    validates_presence_of :specialization
+    validates :work_experience,
+              numericality: { only_integer: true },
+              allow_blank: false,
+              presence: true
+  end
+end
+
+module Admin
+  class Service < ApplicationRecord
+    has_and_belongs_to_many :orders, class_name: "Admin::Order"
+
+    pg_search_scope :search, against: %i[id
+                                         description
+                                         title
+                                         price]
+
+    validates_presence_of :description, :title
+    validates :price,
+              numericality: { only_integer: false, greater_than: 0 },
+              allow_blank: false,
+              presence: true
+  end
+end
+
+module Admin
+  class NavigationBuilder
+    def call(current_ability:)
+      build(current_ability)
+    end
+
+    private
+
+    def build(current_ability)
+      current_ability::MODELS.each_with_object([]) do |item, memo|
+        controller_name = item.class_name.pluralize
+        memo << { lable: controller_name, model: item }
+      end
+    end
+  end
+end
+
+module Api
+  module V1
+    class CustomersSerializer < BaseSerializer
+      set_type :customer
+
+      set_key_transform :camel_lower
+
+      attributes :id,
+                 :first_name,
+                 :last_name,
+                 :father_name
+    end
+  end
+end
+
+module Api
+  module V1
+    class OrdersSerializer < BaseSerializer
+      set_type :order
+
+      set_key_transform :camel_lower
+
+      attributes :id,
+                 :end_execution_at,
+                 :start_execution_at
+
+      attribute :discount do |object, _params|
+        discounts = Admin::Discount.where(id: object.admin_discount_id)
+        DiscountsSerializer.new(discounts).as_json
+      end
+
+      attribute :master do |object, _params|
+        masters = Admin::Master.where(id: object.admin_master_id)
+        MastersSerializer.new(masters).as_json
+      end
+
+      attribute :customer do |object, _params|
+        masters = Admin::Customer.where(id: object.admin_customer_id)
+        CustomersSerializer.new(masters).as_json
+      end
+    end
+  end
+end
+
+module Api
+  module V1
+    class ServicesSerializer < BaseSerializer
+      set_type :services
+
+      set_key_transform :camel_lower
+
+      attributes :id,
+                 :description,
+                 :title
+      attribute :price do |object, _params|
+        object.price.round(2)
+      end
+    end
+  end
+end
+
+module Api
+  module V1
+    class MastersSerializer < BaseSerializer
+      set_type :master
+
+      set_key_transform :camel_lower
+
+      attributes :id,
+                 :last_name,
+                 :first_name,
+                 :father_name,
+                 :specialization,
+                 :work_experience
+    end
+  end
+end
+
+module Api
+  module V1
+    class NewsSerializer < BaseSerializer
+      set_type :news
+
+      set_key_transform :camel_lower
+
+      attributes :id,
+                 :title,
+                 :content
+    end
+  end
+end
+
+module Api
+  module V1
+    class DiscountsSerializer < BaseSerializer
+      set_type :discount
+
+      set_key_transform :camel_lower
+
+      attributes :id,
+                 :title,
+                 :description,
+                 :end_date_at,
+                 :start_date_at,
+                 :percent
+    end
+  end
+end
+
+module Admin
+  module Locale
+    extend ActiveSupport::Concern
+
+    included do
+      helper_method :t
+
+      def t(key, options = {})
+        super key, options.deep_merge(scope: :admin) { |_key, prev_value, curr_value| "#{curr_value}.#{prev_value}" }
+      end
+    end
+  end
+end
+
+module Admin
+  module SiteHandler
+    extend ActiveSupport::Concern
+
+    included do
+      include ::SiteHandler
+    end
+  end
+end
+
+module Admin
+  module Datatable
+    extend ActiveSupport::Concern
+
+    class_methods do
+      attr_reader :model, :exclude_attributes
+
+      def datatable(model: nil, exclude_attributes: [])
+        @model = model
+        @exclude_attributes = exclude_attributes
+      end
+    end
+
+    included do
+      private
+
+      def render_datatable_json
+        render(json: serialized_json)
+      rescue Datatable::QueryError => exception
+        log_error(exception.message)
+        head exception.status_code
+      end
+
+      def model_attributes
+        self.class.model.column_names - self.class.exclude_attributes
+      end
+
+      def model
+        self.class.model
+      end
+
+      def log_error(message)
+        Rails.logger.error("#{self.class.name}: #{message}")
+      end
+
+      def respond_with_search
+        items = model.search(search_params)
+        return model.all.order(id: :ASC) unless items.present?
+
+        items
+      end
+
+      def search_params
+        params.fetch(:search, "")
+      end
+
+      def buld_like_query
+        where("title LIKE ?", "%#{search}%")
+      end
+    end
+  end
+end
+
+module Api
+  module V1
+    class MastersController < Api::ApplicationController
+      def index
+        data = repository
+
+        render json: serialize_data(data)
+      end
+
+      private
+
+      def repository
+        Admin::Master.all
+      end
+
+      def serialize_data(data)
+        Api::V1::MastersSerializer.new(data).as_json
+      end
+    end
+  end
+end
+
+module Api
+  module V1
+    class ServicesController < Api::ApplicationController
+      def index
+        data = repository
+
+        render json: serialize_data(data)
+      end
+
+      private
+
+      def repository
+        Admin::Service.all
+      end
+
+      def serialize_data(data)
+        Api::V1::ServicesSerializer.new(data).as_json
+      end
+    end
+  end
+end
+
+module Api
+  module V1
+    class OrdersController < Api::ApplicationController
+      def index
+        data = repository
+
+        render json: serialize_data(data)
+      end
+
+      private
+
+      def repository
+        Admin::Order.all
+      end
+
+      def serialize_data(data)
+        Api::V1::OrdersSerializer.new(data).as_json
+      end
+    end
+  end
+end
+
+module Api
+  module V1
+    class DiscountsController < Api::ApplicationController
+      def index
+        data = repository
+
+        render json: serialize_data(data)
+      end
+
+      private
+
+      def repository
+        Admin::Discount.all
+      end
+
+      def serialize_data(data)
+        Api::V1::DiscountsSerializer.new(data).as_json
+      end
+    end
+  end
+end
+
+module Api
+  module V1
+    class NewsController < Api::ApplicationController
+      def index
+        data = repository
+
+        render json: serialize_data(data)
+      end
+
+      private
+
+      def repository
+        Admin::News.all
+      end
+
+      def serialize_data(data)
+        Api::V1::NewsSerializer.new(data).as_json
+      end
+    end
+  end
+end
+
+module Api
+  module V1
+    class CustomersController < Api::ApplicationController
+      def index
+        data = repository
+
+        render json: serialize_data(data)
+      end
+
+      private
+
+      def repository
+        Admin::Customer.all
+      end
+
+      def serialize_data(data)
+        Api::V1::CustomersSerializer.new(data).as_json
+      end
+    end
+  end
+end
+
+module Api
+  module V1
+    module Report
+      class GrowthCustomersController < Api::ApplicationController
+        def index
+          respond_html_json_and_pdf_for(customers_growth_options)
+        end
+
+        private
+
+        def customers_growth_options
+          Admin::Customer.group_by_month(:created_at).count
+        end
+      end
+    end
+  end
+end
+
+module Api
+  module V1
+    module Report
+      class OrdersController < Api::ApplicationController
+        def most_expensive
+          respond_html_json_and_pdf_for(most_expensive_options)
+        end
+
+        def accepted_by_master
+          respond_html_json_and_pdf_for(accepted_by_master_options)
+        end
+
+        private
+
+        def accepted_by_master_options
+          Admin::Order.joins(:master).group(:"admin_masters.id")
+            .count.each_with_object([]) do |element, memo|
+            next unless element.first.present?
+
+            memo << [Admin::Master.find(element.first).full_name, element.last]
+          end
+        end
+
+        def most_expensive_options
+          Admin::Order.all.group_by(&:total_sum)
+            .sort.each_with_object([]) do |element, hash|
+            hash << [I18n.t("reports.order",
+                            order_id: element.last.first.id),
+                     element.first]
+          end
+        end
+      end
+    end
+  end
+end
+
+module Api
+  module V1
+    module Report
+      class IncreaseOrdersController < Api::ApplicationController
+        def index
+          respond_html_json_and_pdf_for(increase_orders_options)
+        end
+
+        private
+
+        def increase_orders_options
+          Admin::Order.group_by_day_of_week(:created_at).count
+            .each_with_object([]) do |element, memo|
+            memo << [Date::DAYNAMES[element.first], element.last]
+          end
+        end
+      end
+    end
+  end
+end
